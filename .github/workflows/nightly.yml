@@ -4,7 +4,7 @@ name: Nightly
 
 env:
   RUSTFLAGS: "-D warnings"
-  TOOLCHAIN: "nightly-2020-10-25"
+  TOOLCHAIN: "nightly"
 
 jobs:
   quiche:
@@ -39,7 +39,7 @@ jobs:
         uses: actions-rs/cargo@v1
         with:
           command: test
-          args: --verbose --features qlog
+          args: --tests --examples --verbose --features qlog
 
       - name: Run cargo package
         uses: actions-rs/cargo@v1

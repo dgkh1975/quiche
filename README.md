@@ -47,7 +47,7 @@ Getting Started
 Before diving into the quiche API, here are a few examples on how to use the
 quiche tools provided as part of the [quiche-apps](tools/apps/) crate.
 
-The client can be run as follows:
+After cloning the project according to the command mentioned in the [building](#building) section, the client can be run as follows:
 
 ```bash
  $ cargo run --manifest-path=tools/apps/Cargo.toml --bin quiche-client -- https://cloudflare-quic.com/
@@ -97,9 +97,11 @@ incoming packets that belong to that connection from the network:
 
 ```rust
 loop {
-    let read = socket.recv(&mut buf).unwrap();
+    let (read, from) = socket.recv_from(&mut buf).unwrap();
 
-    let read = match conn.recv(&mut buf[..read]) {
+    let recv_info = quiche::RecvInfo { from };
+
+    let read = match conn.recv(&mut buf[..read], recv_info) {
         Ok(v) => v,
 
         Err(e) => {
@@ -117,7 +119,7 @@ instead:
 
 ```rust
 loop {
-    let write = match conn.send(&mut out) {
+    let (write, send_info) = match conn.send(&mut out) {
         Ok(v) => v,
 
         Err(quiche::Error::Done) => {
@@ -131,7 +133,7 @@ loop {
         },
     };
 
-    socket.send(&out[..write]).unwrap();
+    socket.send_to(&out[..write], &send_info.to).unwrap();
 }
 ```
 
@@ -154,7 +156,7 @@ conn.on_timeout();
 
 // Send more packets as needed after timeout.
 loop {
-    let write = match conn.send(&mut out) {
+    let (write, send_info) = match conn.send(&mut out) {
         Ok(v) => v,
 
         Err(quiche::Error::Done) => {
@@ -168,7 +170,7 @@ loop {
         },
     };
 
-    socket.send(&out[..write]).unwrap();
+    socket.send_to(&out[..write], &send_info.to).unwrap();
 }
 ```
 
@@ -239,12 +241,15 @@ When running ``cargo build``, a static library called ``libquiche.a`` will be
 built automatically alongside the Rust one. This is fully stand-alone and can
 be linked directly into C/C++ applications.
 
+Note that in order to enable the FFI API, the ``ffi`` feature must be enabled (it
+is disabled by default), by passing ``--features ffi`` to ``cargo``.
+
 [thin C API]: https://github.com/cloudflare/quiche/blob/master/include/quiche.h
 
 Building
 --------
 
-quiche requires Rust 1.47 or later to build. The latest stable Rust release can
+quiche requires Rust 1.50 or later to build. The latest stable Rust release can
 be installed using [rustup](https://rustup.rs/).
 
 Once the Rust build environment is setup, the quiche source code can be fetched
@@ -309,17 +314,17 @@ Depending on the NDK version used, you can take one of the following procedures:
 #### NDK version >= 19
 
 For NDK version 19 or higher (21 recommended), you can build in a simpler
-way using [cargo-ndk]. You need to install [cargo-ndk] first.
+way using [cargo-ndk]. You need to install [cargo-ndk] (v2.0 or later) first.
 
 ```bash
  $ cargo install cargo-ndk
 ```
 
 You can build the quiche library using the following procedure. Note that
-`--target` and `--android-platform` are mandatory.
+`-t <architecture>` and `-p <NDK version>` are mandatory.
 
 ```bash
- $ cargo ndk --target aarch64-linux-android --android-platform 21 -- build
+ $ cargo ndk -t arm64-v8a -p 21 -- build --features ffi
 ```
 
 See [build_android_ndk19.sh] for more information.
@@ -383,13 +388,13 @@ To build quiche for iOS, you need the following:
 To build libquiche, run the following command:
 
 ```bash
- $ cargo lipo
+ $ cargo lipo --features ffi
 ```
 
 or
 
 ```bash
- $ cargo lipo --release
+ $ cargo lipo --features ffi --release
 ```
 
 iOS build is tested in Xcode 10.1 and Xcode 11.2.
