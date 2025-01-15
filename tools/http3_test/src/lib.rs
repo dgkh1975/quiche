@@ -43,7 +43,7 @@
 //! let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! let mut reqs = Vec::new();
 //!
-//! reqs.push(http3_test::Http3Req::new("GET", &url, None, None));
+//! reqs.push(http3_test::Http3Req::new(b"GET", &url, None, None));
 //! ```
 //!
 //! Assertions are used to check the received response headers and body
@@ -69,8 +69,8 @@
 //! let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! let mut reqs = Vec::new();
 //!
-//! let expect_hdrs = Some(vec![quiche::h3::Header::new(":status", "200")]);
-//! reqs.push(http3_test::Http3Req::new("GET", &url, None, expect_hdrs));
+//! let expect_hdrs = Some(vec![quiche::h3::Header::new(b":status", "200")]);
+//! reqs.push(http3_test::Http3Req::new(b"GET", &url, None, expect_hdrs));
 //! ```
 //!
 //! The [`assert_headers!`] macro can be used to validate the received headers,
@@ -89,8 +89,8 @@
 //! let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! let mut reqs = Vec::new();
 //!
-//! let expect_hdrs = Some(vec![quiche::h3::Header::new(":status", "200")]);
-//! reqs.push(http3_test::Http3Req::new("GET", &url, None, expect_hdrs));
+//! let expect_hdrs = Some(vec![quiche::h3::Header::new(b":status", "200")]);
+//! reqs.push(http3_test::Http3Req::new(b"GET", &url, None, expect_hdrs));
 //!
 //! // Using a closure...
 //! let assert =
@@ -113,8 +113,8 @@
 //! ```no_run
 //! # let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! # let mut reqs = Vec::new();
-//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(":status", "200")]);
-//! # reqs.push(http3_test::Http3Req::new("GET", &url, None, expect_hdrs));
+//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(b":status", "200")]);
+//! # reqs.push(http3_test::Http3Req::new(b"GET", &url, None, expect_hdrs));
 //! # // Using a closure...
 //! # let assert = |reqs: &[http3_test::Http3Req]| {
 //! #   http3_test::assert_headers!(reqs[0]);
@@ -144,8 +144,8 @@
 //! ```no_run
 //! # let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! # let mut reqs = Vec::new();
-//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(":status", "200")]);
-//! # reqs.push(http3_test::Http3Req::new("GET", &url, None, expect_hdrs));
+//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(b":status", "200")]);
+//! # reqs.push(http3_test::Http3Req::new(b"GET", &url, None, expect_hdrs));
 //! # // Using a closure...
 //! # let assert = |reqs: &[http3_test::Http3Req]| {
 //! #   http3_test::assert_headers!(reqs[0]);
@@ -157,7 +157,7 @@
 //! # let h3_config = quiche::h3::Config::new()?;
 //! # let mut http3_conn = quiche::h3::Connection::with_transport(&mut conn, &h3_config)?;
 //! match http3_conn.poll(&mut conn) {
-//!     Ok((stream_id, quiche::h3::Event::Headers{list, has_body})) => {
+//!     Ok((stream_id, quiche::h3::Event::Headers{list, more_frames})) => {
 //!         test.add_response_headers(stream_id, &list);
 //!     },
 //!
@@ -184,8 +184,8 @@
 //! ```no_run
 //! # let mut url = url::Url::parse("https://cloudflare-quic.com/b/get").unwrap();
 //! # let mut reqs = Vec::new();
-//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(":status", "200")]);
-//! # reqs.push(http3_test::Http3Req::new("GET", &url, None, expect_hdrs));
+//! # let expect_hdrs = Some(vec![quiche::h3::Header::new(b":status", "200")]);
+//! # reqs.push(http3_test::Http3Req::new(b"GET", &url, None, expect_hdrs));
 //! # // Using a closure...
 //! # let assert = |reqs: &[http3_test::Http3Req]| {
 //! #   http3_test::assert_headers!(reqs[0]);
@@ -230,8 +230,9 @@ extern crate log;
 use std::collections::HashMap;
 
 use quiche::h3::Header;
+use quiche::h3::NameValue;
 
-pub const USER_AGENT: &str = "quiche-http3-integration-client";
+pub const USER_AGENT: &[u8] = b"quiche-http3-integration-client";
 
 /// Stores the request, the expected response headers, and the actual response.
 ///
@@ -241,10 +242,11 @@ pub const USER_AGENT: &str = "quiche-http3-integration-client";
 pub struct Http3Req {
     pub url: url::Url,
     pub hdrs: Vec<Header>,
-    body: Option<Vec<u8>>,
+    pub body: Option<Vec<u8>>,
     pub expect_resp_hdrs: Option<Vec<Header>>,
     pub resp_hdrs: Vec<Header>,
     pub resp_body: Vec<u8>,
+    pub reset_stream_code: Option<u64>,
 }
 
 impl Http3Req {
@@ -259,15 +261,18 @@ impl Http3Req {
         }
 
         let mut hdrs = vec![
-            Header::new(":method", method),
-            Header::new(":scheme", url.scheme()),
-            Header::new(":authority", url.host_str().unwrap()),
-            Header::new(":path", &path),
-            Header::new("user-agent", USER_AGENT),
+            Header::new(b":method", method.as_bytes()),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
         ];
 
         if let Some(body) = &body {
-            hdrs.push(Header::new("content-length", &body.len().to_string()));
+            hdrs.push(Header::new(
+                b"content-length",
+                body.len().to_string().as_bytes(),
+            ));
         }
 
         Http3Req {
@@ -277,8 +282,32 @@ impl Http3Req {
             expect_resp_hdrs,
             resp_hdrs: Vec::new(),
             resp_body: Vec::new(),
+            reset_stream_code: None,
         }
     }
+
+    /// Add a new [`Header`] to the request. If the request already contains a
+    /// header with the new header's name, the existing header's value will
+    /// be replaced with that of the new one.
+    pub fn add_or_replace_header(
+        header_list: &mut Vec<Header>, new_header: Header,
+    ) {
+        if let Some(hdr_in_list) = find_header(header_list, &new_header) {
+            *hdr_in_list = new_header;
+
+            return;
+        }
+
+        header_list.push(new_header.clone());
+    }
+}
+
+fn find_header<'a>(
+    header_list: &'a mut [Header], header: &Header,
+) -> Option<&'a mut Header> {
+    header_list
+        .iter_mut()
+        .find(|curr| curr.name() == header.name())
 }
 
 /// Asserts that the Http3Req received response headers match the expected
@@ -297,11 +326,10 @@ macro_rules! assert_headers {
         if let Some(expect_hdrs) = &$req.expect_resp_hdrs {
             for hdr in expect_hdrs {
                 match $req.resp_hdrs.iter().find(|&x| x.name() == hdr.name()) {
-                    Some(h) => { assert_eq!(hdr.value(), h.value());},
+                    Some(h) => assert_eq!(hdr.value(), h.value()),
 
-                    None => {
-                        panic!(format!("assertion failed: expected response header field {} not present!", hdr.name()));
-                    }
+                    None =>
+                        panic!("assertion failed: expected response header field {} not present!", std::str::from_utf8(hdr.name()).unwrap()),
                 }
             }
         }
@@ -314,7 +342,7 @@ macro_rules! assert_headers {
                     Some(h) => { assert_eq!(hdr.value(), h.value(), $($arg)+);},
 
                     None => {
-                        panic!(format!("assertion failed: expected response header field {} not present! {}", hdr.name(), $($arg)+));
+                        panic!("assertion failed: expected response header field {} not present! {}", hdr.name(), $($arg)+);
                     }
                 }
             }
@@ -327,6 +355,19 @@ macro_rules! assert_headers {
 /// Each test assertion can check the set of Http3Req
 /// however they like.
 pub type Http3Assert = fn(&[Http3Req]);
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum Http3TestError {
+    HandshakeFail,
+    HttpFail,
+    Other(String),
+}
+
+pub struct ArbitraryStreamData {
+    pub stream_id: u64,
+    pub data: Vec<u8>,
+    pub fin: bool,
+}
 
 /// The main object for getting things done.
 ///
@@ -341,6 +382,7 @@ pub type Http3Assert = fn(&[Http3Req]);
 pub struct Http3Test {
     endpoint: url::Url,
     reqs: Vec<Http3Req>,
+    stream_data: Option<Vec<ArbitraryStreamData>>,
     assert: Http3Assert,
     issued_reqs: HashMap<u64, usize>,
     concurrent: bool,
@@ -355,6 +397,23 @@ impl Http3Test {
         Http3Test {
             endpoint,
             reqs,
+            stream_data: None,
+            assert,
+            issued_reqs: HashMap::new(),
+            concurrent,
+            current_idx: 0,
+        }
+    }
+
+    pub fn with_stream_data(
+        endpoint: url::Url, reqs: Vec<Http3Req>,
+        stream_data: Vec<ArbitraryStreamData>, assert: Http3Assert,
+        concurrent: bool,
+    ) -> Http3Test {
+        Http3Test {
+            endpoint,
+            reqs,
+            stream_data: Some(stream_data),
             assert,
             issued_reqs: HashMap::new(),
             concurrent,
@@ -377,6 +436,22 @@ impl Http3Test {
         &mut self, conn: &mut quiche::Connection,
         h3_conn: &mut quiche::h3::Connection,
     ) -> quiche::h3::Result<()> {
+        if let Some(stream_data) = &self.stream_data {
+            for d in stream_data {
+                match conn.stream_send(d.stream_id, &d.data, d.fin) {
+                    Ok(_) => (),
+
+                    Err(e) => {
+                        error!(
+                            "failed to send data on stream {}: {:?}",
+                            d.stream_id, e
+                        );
+                        return Err(From::from(e));
+                    },
+                }
+            }
+        }
+
         if self.reqs.len() - self.current_idx == 0 {
             return Err(quiche::h3::Error::Done);
         }
@@ -431,6 +506,13 @@ impl Http3Test {
     ) {
         let i = self.issued_reqs.get(&stream_id).unwrap();
         self.reqs[*i].resp_body.extend_from_slice(&data[..data_len]);
+    }
+
+    /// Sets the error code when a RESET_STREAM was received for an issued
+    /// request.
+    pub fn set_reset_stream_error(&mut self, stream_id: u64, error: u64) {
+        let i = self.issued_reqs.get(&stream_id).unwrap();
+        self.reqs[*i].reset_stream_code = Some(error);
     }
 
     /// Execute the test assertion(s).

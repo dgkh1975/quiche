@@ -1,16 +1,15 @@
-FROM rust:1.47 as build
+FROM rust:1.70 as build
 
 WORKDIR /build
 
-COPY deps/ ./deps/
-COPY src/ ./src/
-COPY tools/ ./tools/
-COPY Cargo.toml .
+COPY apps/ ./apps/
+COPY octets/ ./octets/
+COPY qlog/ ./qlog/
+COPY quiche/ ./quiche/
 
-RUN apt-get update && apt-get install -y cmake && \
-    rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y cmake && rm -rf /var/lib/apt/lists/*
 
-RUN cargo build --manifest-path tools/apps/Cargo.toml
+RUN cargo build --manifest-path apps/Cargo.toml
 
 ##
 ## quiche-base: quiche image for apps
@@ -21,8 +20,8 @@ RUN apt-get update && apt-get install -y ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build \
-     /build/tools/apps/target/debug/quiche-client \
-     /build/tools/apps/target/debug/quiche-server \
+     /build/apps/target/debug/quiche-client \
+     /build/apps/target/debug/quiche-server \
      /usr/local/bin/
 
 ENV PATH="/usr/local/bin/:${PATH}"
@@ -37,10 +36,12 @@ FROM martenseemann/quic-network-simulator-endpoint:latest as quiche-qns
 
 WORKDIR /quiche
 
+RUN apt-get update && apt-get install -y wait-for-it && rm -rf /var/lib/apt/lists/*
+
 COPY --from=build \
-     /build/tools/apps/target/debug/quiche-client \
-     /build/tools/apps/target/debug/quiche-server \
-     /build/tools/qns/run_endpoint.sh \
+     /build/apps/target/debug/quiche-client \
+     /build/apps/target/debug/quiche-server \
+     /build/apps/run_endpoint.sh \
      ./
 
 ENV RUST_LOG=trace

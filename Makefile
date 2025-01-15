@@ -6,7 +6,7 @@ BASE_TAG  = latest
 QNS_REPO  = cloudflare/quiche-qns
 QNS_TAG   = latest
 
-FUZZ_REPO = mayhem.cloudflare-security.com:5000/protocols/quiche-libfuzzer
+FUZZ_REPO = cloudflare.mayhem.security:5000/protocols/quiche-libfuzzer
 FUZZ_TAG  = latest
 
 docker-build: docker-base docker-qns
@@ -14,7 +14,7 @@ docker-build: docker-base docker-qns
 # build quiche-apps only
 .PHONY: build-apps
 build-apps:
-	cargo build --manifest-path tools/apps/Cargo.toml
+	cargo build --package=quiche_apps
 
 # build base image
 .PHONY: docker-base
@@ -23,7 +23,7 @@ docker-base: Dockerfile
 
 # build qns image
 .PHONY: docker-qns
-docker-qns: Dockerfile tools/qns/run_endpoint.sh
+docker-qns: Dockerfile apps/run_endpoint.sh
 	$(DOCKER) build --target quiche-qns -t $(QNS_REPO):$(QNS_TAG) .
 
 .PHONY: docker-publish
@@ -34,14 +34,14 @@ docker-publish:
 # build fuzzers
 .PHONY: build-fuzz
 build-fuzz:
-	cargo +nightly fuzz build --release packet_recv_client
-	cargo +nightly fuzz build --release packet_recv_server
-	cargo +nightly fuzz build --release qpack_decode
+	cargo +nightly fuzz build --release --debug-assertions packet_recv_client
+	cargo +nightly fuzz build --release --debug-assertions packet_recv_server
+	cargo +nightly fuzz build --release --debug-assertions qpack_decode
 
 # build fuzzing image
 .PHONY: docker-fuzz
-docker-fuzz: build-fuzz
-	$(DOCKER) build --tag $(FUZZ_REPO):$(FUZZ_TAG) fuzz
+docker-fuzz:
+	$(DOCKER) build -f fuzz/Dockerfile --target quiche-libfuzzer --tag $(FUZZ_REPO):$(FUZZ_TAG) .
 
 .PHONY: docker-fuzz-publish
 docker-fuzz-publish:
