@@ -1,0 +1,40 @@
+[package]
+name = "quiche_apps"
+version = "0.1.0"
+authors = ["Lucas Pardue <lucaspardue.24.7@gmail.com>"]
+edition = { workspace = true }
+repository = { workspace = true }
+license = { workspace = true }
+keywords = { workspace = true }
+categories = { workspace = true }
+publish = false
+
+[features]
+# Enable quiche's fuzzing mode.
+fuzzing = ["quiche/fuzzing"]
+
+# Enable qlog support.
+qlog = ["quiche/qlog"]
+
+# Use BoringSSL provided by the boring crate.
+boringssl-boring-crate = ["quiche/boringssl-boring-crate"]
+
+# Enable sfv support.
+sfv = ["quiche/sfv"]
+
+default = ["qlog", "sfv"]
+
+[dependencies]
+docopt = "1"
+env_logger = { workspace = true }
+libc = { workspace = true }
+log = { workspace = true }
+mio = { version = "0.8", features = ["net", "os-poll"] }
+nix = { version = "0.27", features = ["net", "socket", "uio"] }
+octets = { workspace = true }
+quiche = { path = "../quiche" }
+ring = "0.17"
+url = "1"
+
+[lib]
+crate-type = ["lib"]
