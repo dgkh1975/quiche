@@ -28,6 +28,7 @@ mod httpbin_tests {
     use std::collections::HashMap;
     use std::net::ToSocketAddrs;
 
+    use http3_test::Http3TestError::*;
     use http3_test::*;
     use quiche::h3::*;
 
@@ -69,27 +70,14 @@ mod httpbin_tests {
 
     fn verify_peer() -> bool {
         match std::env::var_os("VERIFY_PEER") {
-            Some(val) => match val.to_str().unwrap() {
-                "false" => {
-                    return false;
-                },
-
-                _ => {
-                    return true;
-                },
-            },
-
-            None => {
-                return true;
-            },
-        };
+            Some(val) => !matches!(val.to_str().unwrap(), "false"),
+            None => true,
+        }
     }
 
     fn idle_timeout() -> u64 {
         match std::env::var_os("IDLE_TIMEOUT") {
-            Some(val) =>
-                u64::from_str_radix(&val.into_string().unwrap(), 10).unwrap(),
-
+            Some(val) => val.into_string().unwrap().parse::<u64>().unwrap(),
             None => 60000,
         }
     }
@@ -102,7 +90,7 @@ mod httpbin_tests {
             return Some(parsed.as_object().unwrap().clone());
         }
 
-        return None;
+        None
     }
 
     fn expect_req_headers() -> Option<serde_json::Map<String, serde_json::Value>>
@@ -114,23 +102,34 @@ mod httpbin_tests {
             return Some(parsed.as_object().unwrap().clone());
         }
 
-        return None;
+        None
     }
 
     fn max_data() -> u64 {
         match std::env::var_os("MAX_DATA") {
-            Some(val) =>
-                u64::from_str_radix(&val.into_string().unwrap(), 10).unwrap(),
-
+            Some(val) => val.into_string().unwrap().parse::<u64>().unwrap(),
             None => 1_000_000,
         }
+    }
+
+    fn early_data() -> bool {
+        match std::env::var_os("EARLY_DATA") {
+            Some(val) => matches!(val.to_str().unwrap(), "true"),
+            None => false,
+        }
+    }
+
+    fn session_file() -> Option<String> {
+        std::env::var_os("SESSION_FILE").map(|val| val.into_string().unwrap())
     }
 
     // A rudimentary structure to hold httpbin response data
     #[derive(Debug, serde::Deserialize)]
     struct HttpBinResponseBody {
         args: Option<HashMap<String, String>>,
+        #[allow(dead_code)]
         data: Option<String>,
+        #[allow(dead_code)]
         files: Option<HashMap<String, String>>,
         form: Option<HashMap<String, String>>,
         headers: Option<HashMap<String, String>>,
@@ -141,27 +140,59 @@ mod httpbin_tests {
         #[serde(rename = "content-type")]
         content_type: Option<Vec<String>>,
         origin: Option<String>,
+        #[allow(dead_code)]
         url: Option<String>,
     }
 
     fn jsonify(data: &[u8]) -> HttpBinResponseBody {
-        serde_json::from_slice(&data).unwrap()
+        serde_json::from_slice(data).unwrap()
     }
 
-    fn do_test(reqs: Vec<Http3Req>, assert: Http3Assert, concurrent: bool) {
-        INIT.call_once(|| {
-            env_logger::builder()
-                .default_format_timestamp_nanos(true)
-                .init()
-        });
+    fn do_test(
+        reqs: Vec<Http3Req>, assert: Http3Assert, concurrent: bool,
+    ) -> std::result::Result<(), Http3TestError> {
+        INIT.call_once(|| env_logger::builder().format_timestamp_nanos().init());
 
         let mut test = Http3Test::new(endpoint(None), reqs, assert, concurrent);
-        runner::run(&mut test, host(), verify_peer(), idle_timeout(), max_data());
+        runner::run(
+            &mut test,
+            host(),
+            verify_peer(),
+            idle_timeout(),
+            max_data(),
+            early_data(),
+            session_file(),
+        )
+    }
+
+    fn do_test_with_stream_data(
+        reqs: Vec<Http3Req>, stream_data: Vec<ArbitraryStreamData>,
+        assert: Http3Assert, concurrent: bool,
+    ) -> std::result::Result<(), Http3TestError> {
+        INIT.call_once(|| env_logger::builder().format_timestamp_nanos().init());
+
+        let mut test = Http3Test::with_stream_data(
+            endpoint(None),
+            reqs,
+            stream_data,
+            assert,
+            concurrent,
+        );
+        runner::run(
+            &mut test,
+            host(),
+            verify_peer(),
+            idle_timeout(),
+            max_data(),
+            early_data(),
+            session_file(),
+        )
     }
 
     // Build a single request and expected response with status code
     fn request_check_status(testpoint: &str, status: usize) -> Vec<Http3Req> {
-        let expect_hdrs = Some(vec![Header::new(":status", &status.to_string())]);
+        let expect_hdrs =
+            Some(vec![Header::new(b":status", status.to_string().as_bytes())]);
 
         let url = endpoint(Some(testpoint));
 
@@ -170,7 +201,7 @@ mod httpbin_tests {
 
     // Build a single request with a simple JSON body using the provided method
     fn request_with_body(method: &str) -> Vec<Http3Req> {
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some(&method.to_ascii_lowercase()));
 
@@ -184,7 +215,7 @@ mod httpbin_tests {
         );
 
         req.hdrs
-            .push(Header::new("content-type", "application/json"));
+            .push(Header::new(b"content-type", b"application/json"));
 
         vec![req]
     }
@@ -207,7 +238,7 @@ mod httpbin_tests {
     #[test]
     fn get() {
         let mut reqs = Vec::new();
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let mut url = endpoint(Some("get"));
 
@@ -229,7 +260,672 @@ mod httpbin_tests {
             }
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_no_method() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            expect_resp_hdrs: expect_hdrs,
+            body: None,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_empty_method() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b""),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_invalid_method() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"$GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_no_scheme() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_empty_scheme() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", b""),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_invalid_scheme() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", b"$fail"),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_no_authority() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_empty_authority() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":authority", b""),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_no_path() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_empty_path() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":path", b""),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_invalid_pseudoheader_name() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":$method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_duplicate_pseudoheader_bad_order() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"400")]);
+
+        let url = endpoint(Some("get"));
+        let path = String::from(url.path());
+
+        let hdrs = vec![
+            Header::new(b":method", b"GET"),
+            Header::new(b":scheme", url.scheme().as_bytes()),
+            Header::new(b":path", path.as_bytes()),
+            Header::new(b":authority", url.host_str().unwrap().as_bytes()),
+            Header::new(b"user-agent", USER_AGENT),
+            Header::new(b":method", b"GET"),
+        ];
+
+        let req = Http3Req {
+            url: url.clone(),
+            hdrs,
+            body: None,
+            expect_resp_hdrs: expect_hdrs,
+            resp_hdrs: Vec::new(),
+            resp_body: Vec::new(),
+            reset_stream_code: None,
+        };
+
+        reqs.push(req);
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn req_too_large_headers() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        // This test explicitly tries to exceed the server's
+        // MAX_FIELD_SECTION_SIZE setting. Therefore, it is expected that
+        // the invoker supplies an additional header to this test
+        // via the EXTRA_HEADERS environment variable.
+        if let Some(headers) = &extra_headers() {
+            for (name, val) in headers {
+                println!("{}: {}", name, val);
+                reqs[0].hdrs.push(Header::new(
+                    name.as_bytes(),
+                    val.as_str().unwrap().as_bytes(),
+                ));
+            }
+        };
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        assert_eq!(Err(HttpFail), do_test(reqs, assert, true));
+    }
+
+    #[test]
+    fn frames_duplicate_settings() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let mut stream_data = Vec::new();
+
+        // A buffer holding a valid SETTINGS frame encoded in wire format.
+        let d = vec![
+            4, 16, 213, 164, 106, 24, 4, 152, 223, 76, 209, 101, 114, 237, 239,
+            178, 71, 46,
+        ];
+
+        let data_frame = ArbitraryStreamData {
+            stream_id: 0,
+            data: d,
+            fin: false,
+        };
+
+        stream_data.push(data_frame);
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn frames_max_push_on_request() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let mut stream_data = Vec::new();
+
+        // A buffer containing a valid MAX_PUSH_ID frame encoded in wire format.
+        let d = vec![13, 1, 4];
+
+        let data_frame = ArbitraryStreamData {
+            stream_id: 0,
+            data: d,
+            fin: false,
+        };
+
+        stream_data.push(data_frame);
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn frames_data_on_control() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let mut stream_data = Vec::new();
+
+        // A buffer containing a 0-length DATA frame encoded in wire format.
+        let d = vec![0; 2];
+
+        let data_frame = ArbitraryStreamData {
+            stream_id: 0,
+            data: d,
+            fin: false,
+        };
+
+        stream_data.push(data_frame);
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn frames_data_before_headers() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let mut stream_data = Vec::new();
+
+        // A buffer containing a 0-length DATA frame encoded in wire format.
+        let d = vec![0; 2];
+
+        let data_frame = ArbitraryStreamData {
+            stream_id: 0,
+            data: d,
+            fin: false,
+        };
+
+        stream_data.push(data_frame);
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn frames_too_small_headers() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let mut stream_data = Vec::new();
+
+        // A buffer of containing an invalid HEADERS frame encoded in wire format.
+        let d = vec![1, 3, 1, 1, 1];
+
+        let data_frame = ArbitraryStreamData {
+            stream_id: 4,
+            data: d,
+            fin: false,
+        };
+
+        stream_data.push(data_frame);
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn stream_close_control() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let stream_data = vec![ArbitraryStreamData {
+            stream_id: 2,
+            data: b"".to_vec(),
+            fin: true,
+        }];
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn stream_close_qpack_enc() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let stream_data = vec![ArbitraryStreamData {
+            stream_id: 6,
+            data: b"".to_vec(),
+            fin: true,
+        }];
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
+    }
+
+    #[test]
+    fn stream_close_qpack_dec() {
+        let mut reqs = Vec::new();
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let url = endpoint(Some("get"));
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs.clone()));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+        };
+
+        let stream_data = vec![ArbitraryStreamData {
+            stream_id: 10,
+            data: b"".to_vec(),
+            fin: true,
+        }];
+
+        assert_eq!(
+            Err(HttpFail),
+            do_test_with_stream_data(reqs, stream_data, assert, true)
+        );
     }
 
     #[test]
@@ -243,7 +939,7 @@ mod httpbin_tests {
             assert!(json.origin.is_some())
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
@@ -254,16 +950,19 @@ mod httpbin_tests {
             assert_headers!(reqs[0]);
 
             let json = jsonify(&reqs[0].resp_body);
-            assert_eq!(json.user_agent, Some(USER_AGENT.to_string()));
+            assert_eq!(
+                json.user_agent,
+                String::from_utf8(USER_AGENT.to_vec()).ok()
+            );
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
     fn headers() {
         let mut reqs = Vec::new();
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let mut url = endpoint(Some("headers"));
         url.set_query(Some("show_env=1")); // reveal X-Forwarded-* headers
@@ -271,7 +970,10 @@ mod httpbin_tests {
 
         if let Some(headers) = &extra_headers() {
             for (name, val) in headers {
-                reqs[0].hdrs.push(Header::new(&name, val.as_str().unwrap()));
+                reqs[0].hdrs.push(Header::new(
+                    name.as_bytes(),
+                    val.as_str().unwrap().as_bytes(),
+                ));
             }
         };
 
@@ -303,31 +1005,31 @@ mod httpbin_tests {
             }
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
     fn post() {
         let reqs = request_with_body("post");
-        do_test(reqs, assert_request_body, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_request_body, true));
     }
 
     #[test]
     fn put() {
         let reqs = request_with_body("put");
-        do_test(reqs, assert_request_body, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_request_body, true));
     }
 
     #[test]
     fn patch() {
         let reqs = request_with_body("patch");
-        do_test(reqs, assert_request_body, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_request_body, true));
     }
 
     #[test]
     fn delete() {
         let reqs = request_with_body("delete");
-        do_test(reqs, assert_request_body, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_request_body, true));
     }
 
     #[test]
@@ -335,15 +1037,15 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         let expect_hdrs = Some(vec![
-            Header::new(":status", "200"),
-            Header::new("content-type", "text/html; charset=utf-8"),
+            Header::new(b":status", b"200"),
+            Header::new(b"content-type", b"text/html; charset=utf-8"),
         ]);
 
         let url = endpoint(Some("encoding/utf8"));
 
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -351,18 +1053,18 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         let expect_hdrs = Some(vec![
-            Header::new(":status", "200"),
-            Header::new("content-encoding", "gzip"),
+            Header::new(b":status", b"200"),
+            Header::new(b"content-encoding", b"gzip"),
         ]);
 
         let url = endpoint(Some("gzip"));
 
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("accept-encoding", "gzip"));
+        req.hdrs.push(Header::new(b"accept-encoding", b"gzip"));
 
         reqs.push(req);
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -371,15 +1073,15 @@ mod httpbin_tests {
 
         // Not all servers actually take up the deflate option,
         // so don't check content-type response header.
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some("deflate"));
 
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("accept-encoding", "deflate"));
+        req.hdrs.push(Header::new(b"accept-encoding", b"deflate"));
         reqs.push(req);
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -388,8 +1090,10 @@ mod httpbin_tests {
 
         for i in (200..600).step_by(100) {
             for j in 0..5 {
-                let expect_hdrs =
-                    Some(vec![Header::new(":status", &(i + j).to_string())]);
+                let expect_hdrs = Some(vec![Header::new(
+                    b":status",
+                    (i + j).to_string().as_bytes(),
+                )]);
 
                 let testpoint = format!("{}/{}", "status", i + j);
                 let url = endpoint(Some(&testpoint));
@@ -398,13 +1102,13 @@ mod httpbin_tests {
             }
         }
 
-        do_test(reqs, assert_headers_only, false);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, false));
     }
 
     #[test]
     fn response_headers() {
         let mut reqs = Vec::new();
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let mut url = endpoint(Some("response-headers"));
         url.set_query(Some(
@@ -424,7 +1128,7 @@ mod httpbin_tests {
             assert_eq!(content_type[1], "text/plain; charset=UTF-8");
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
@@ -434,8 +1138,8 @@ mod httpbin_tests {
 
         // Request 1
         let expect_hdrs = Some(vec![
-            Header::new(":status", "302"),
-            Header::new("location", "https://example.com"),
+            Header::new(b":status", b"302"),
+            Header::new(b"location", b"https://example.com"),
         ]);
 
         url.set_query(Some("url=https://example.com"));
@@ -444,19 +1148,19 @@ mod httpbin_tests {
 
         // Request 2
         let expect_hdrs = Some(vec![
-            Header::new(":status", "307"),
-            Header::new("location", "https://example.com"),
+            Header::new(b":status", b"307"),
+            Header::new(b"location", b"https://example.com"),
         ]);
         url.set_query(Some("url=https://example.com&status_code=307"));
 
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
         // Request 3
-        let expect_hdrs = Some(vec![Header::new(":status", "302")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"302")]);
         let url = endpoint(Some("relative-redirect/3"));
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -465,21 +1169,21 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         // Request 1
-        let expect_hdrs = Some(vec![Header::new(":status", "302")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"302")]);
         let mut url = endpoint(Some("cookies/set"));
         url.set_query(Some("k1=v1"));
 
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
         // Request 2
-        let expect_hdrs = Some(vec![Header::new(":status", "302")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"302")]);
 
         let mut url = endpoint(Some("cookies/set"));
         url.set_query(Some("k1=v1"));
 
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -488,13 +1192,13 @@ mod httpbin_tests {
         let url = endpoint(Some("basic-auth/user/passwd"));
 
         let expect_hdrs = Some(vec![
-            Header::new(":status", "401"),
-            Header::new("www-authenticate", "Basic realm=\"Fake Realm\""),
+            Header::new(b":status", b"401"),
+            Header::new(b"www-authenticate", b"Basic realm=\"Fake Realm\""),
         ]);
 
         reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -504,9 +1208,9 @@ mod httpbin_tests {
         let sizes = [1, 50, 100];
 
         for size in &sizes {
-            let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+            let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
-            let testpoint = format!("{}/{}", "stream", size.to_string());
+            let testpoint = format!("{}/{}", "stream", size);
 
             let url = endpoint(Some(&testpoint));
 
@@ -537,7 +1241,7 @@ mod httpbin_tests {
             assert_eq!(line_count, 100);
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
@@ -547,7 +1251,7 @@ mod httpbin_tests {
         let delays = [1, 10, 30];
 
         for delay in &delays {
-            let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+            let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
             let testpoint = format!("{}/{}", "delay", delay);
             let url = endpoint(Some(&testpoint));
@@ -555,7 +1259,7 @@ mod httpbin_tests {
             reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
         }
 
-        do_test(reqs, assert_headers_only, false);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, false));
     }
 
     #[test]
@@ -565,7 +1269,7 @@ mod httpbin_tests {
         let durations = [1, 10, 30];
 
         for duration in &durations {
-            let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+            let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
             let mut url = endpoint(Some("drip"));
             url.set_query(Some(&format!(
@@ -576,7 +1280,27 @@ mod httpbin_tests {
             reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
         }
 
-        do_test(reqs, assert_headers_only, false);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, false));
+    }
+
+    #[test]
+    #[cfg(feature = "test_resets")]
+    fn drip_delay_reset() {
+        let mut reqs = Vec::new();
+
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
+        let mut url = endpoint(Some("drip"));
+        url.set_query(Some("duration=30&numbytes=2&delay=1"));
+
+        reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
+
+        let assert = |reqs: &[Http3Req]| {
+            assert_headers!(reqs[0]);
+
+            assert_eq!(reqs[0].reset_stream_code, Some(256));
+        };
+
+        assert_eq!(Ok(()), do_test(reqs, assert, false));
     }
 
     #[test]
@@ -584,7 +1308,7 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         // Request 1
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some("range/102400"));
 
@@ -593,24 +1317,24 @@ mod httpbin_tests {
 
         // Request 2
         let expect_hdrs = Some(vec![
-            Header::new(":status", "206"),
-            Header::new("content-range", "bytes 0-49/102400"),
+            Header::new(b":status", b"206"),
+            Header::new(b"content-range", b"bytes 0-49/102400"),
         ]);
 
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("range", "bytes=0-49"));
+        req.hdrs.push(Header::new(b"range", b"bytes=0-49"));
         reqs.push(req);
 
         // Request 3
         let expect_hdrs = Some(vec![
-            Header::new(":status", "206"),
-            Header::new("content-range", "bytes 100-10000/102400"),
+            Header::new(b":status", b"206"),
+            Header::new(b"content-range", b"bytes 100-10000/102400"),
         ]);
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("range", "bytes=100-10000"));
+        req.hdrs.push(Header::new(b"range", b"bytes=100-10000"));
         reqs.push(req);
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -618,7 +1342,7 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         // Request 1
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some("cache"));
 
@@ -626,22 +1350,22 @@ mod httpbin_tests {
         reqs.push(req);
 
         // Request 2
-        let expect_hdrs = Some(vec![Header::new(":status", "304")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"304")]);
 
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
         req.hdrs.push(Header::new(
-            "if-modified-since",
-            "Wed, 21 Oct 2015 07:28:00 GMT",
+            b"if-modified-since",
+            b"Wed, 21 Oct 2015 07:28:00 GMT",
         ));
         reqs.push(req);
 
         // Request 3
-        let expect_hdrs = Some(vec![Header::new(":status", "304")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"304")]);
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("if-none-match", "*"));
+        req.hdrs.push(Header::new(b"if-none-match", b"*"));
         reqs.push(req);
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -652,17 +1376,17 @@ mod httpbin_tests {
 
         for size in &sizes {
             let expect_hdrs = Some(vec![
-                Header::new(":status", "200"),
-                Header::new("content-length", &size.to_string()),
+                Header::new(b":status", b"200"),
+                Header::new(b"content-length", size.to_string().as_bytes()),
             ]);
 
-            let testpoint = format!("{}/{}", "bytes", size.to_string());
+            let testpoint = format!("{}/{}", "bytes", size);
             let url = endpoint(Some(&testpoint));
 
             reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
         }
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -672,15 +1396,15 @@ mod httpbin_tests {
         let sizes = [10, 100, 1000, 10000, 100_000];
 
         for size in &sizes {
-            let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+            let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
-            let testpoint = format!("{}/{}", "stream-bytes", size.to_string());
+            let testpoint = format!("{}/{}", "stream-bytes", size);
             let url = endpoint(Some(&testpoint));
 
             reqs.push(Http3Req::new("GET", &url, None, expect_hdrs));
         }
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
@@ -688,41 +1412,41 @@ mod httpbin_tests {
         let mut reqs = Vec::new();
 
         // Request 1
-        let expect_hdrs = Some(vec![Header::new(":status", "406")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"406")]);
 
         let url = endpoint(Some("image"));
 
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("accept", "*/*"));
+        req.hdrs.push(Header::new(b"accept", b"*/*"));
         reqs.push(req);
 
         // Request 2
         let expect_hdrs = Some(vec![
-            Header::new(":status", "200"),
-            Header::new("content-type", "image/png"),
+            Header::new(b":status", b"200"),
+            Header::new(b"content-type", b"image/png"),
         ]);
         let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-        req.hdrs.push(Header::new("accept", "image/*"));
+        req.hdrs.push(Header::new(b"accept", b"image/*"));
         reqs.push(req);
 
         // Multiple requests based on accept
         let formats = ["image/webp", "image/svg+xml", "image/jpeg", "image/png"];
         for format in &formats {
             let expect_hdrs = Some(vec![
-                Header::new(":status", "200"),
-                Header::new("content-type", &format),
+                Header::new(b":status", b"200"),
+                Header::new(b"content-type", format.as_bytes()),
             ]);
 
             let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-            req.hdrs.push(Header::new("accept", &format));
+            req.hdrs.push(Header::new(b"accept", format.as_bytes()));
             reqs.push(req);
         }
 
         // Multiple requests based on path
         for format in &formats {
             let expect_hdrs = Some(vec![
-                Header::new(":status", "200"),
-                Header::new("content-type", &format),
+                Header::new(b":status", b"200"),
+                Header::new(b"content-type", format.as_bytes()),
             ]);
 
             let testpoint = if format == &"image/svg+xml" {
@@ -731,19 +1455,19 @@ mod httpbin_tests {
                 format
             };
 
-            let url = endpoint(Some(&testpoint));
+            let url = endpoint(Some(testpoint));
             let mut req = Http3Req::new("GET", &url, None, expect_hdrs);
-            req.hdrs.push(Header::new("accept", &format));
+            req.hdrs.push(Header::new(b"accept", format.as_bytes()));
             reqs.push(req);
         }
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
     fn form() {
         let mut reqs = Vec::new();
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some("post"));
 
@@ -757,8 +1481,8 @@ mod httpbin_tests {
         );
 
         req.hdrs.push(Header::new(
-            "content-type",
-            "application/x-www-form-urlencoded",
+            b"content-type",
+            b"application/x-www-form-urlencoded",
         ));
         reqs.push(req);
 
@@ -777,38 +1501,38 @@ mod httpbin_tests {
             }
         };
 
-        do_test(reqs, assert, true);
+        assert_eq!(Ok(()), do_test(reqs, assert, true));
     }
 
     #[test]
     fn html() {
         let reqs = request_check_status("html", 200);
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
     fn xml() {
         let reqs = request_check_status("xml", 200);
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
     fn robots() {
         let reqs = request_check_status("robots.txt", 200);
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
     fn links() {
         let reqs = request_check_status("links/10", 302);
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 
     #[test]
     fn zero_length_body() {
         let mut reqs = Vec::new();
 
-        let expect_hdrs = Some(vec![Header::new(":status", "200")]);
+        let expect_hdrs = Some(vec![Header::new(b":status", b"200")]);
 
         let url = endpoint(Some("stream/0"));
 
@@ -816,6 +1540,45 @@ mod httpbin_tests {
         reqs.push(req.clone());
         reqs.push(req);
 
-        do_test(reqs, assert_headers_only, true);
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
+    }
+
+    #[test]
+    fn mismatched_content_length_too_long() {
+        let mut too_long = request_with_body("post")[0].clone();
+        Http3Req::add_or_replace_header(
+            &mut too_long.hdrs,
+            Header::new(b"content-length", b"32"),
+        );
+
+        if let Some(expected_resp_hdrs) = too_long.expect_resp_hdrs.as_mut() {
+            Http3Req::add_or_replace_header(
+                expected_resp_hdrs,
+                Header::new(b":status", b"400"),
+            );
+        }
+
+        let reqs = vec![too_long];
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
+    }
+
+    #[test]
+    fn mismatched_content_length_too_short() {
+        let mut too_short = request_with_body("post")[0].clone();
+
+        Http3Req::add_or_replace_header(
+            &mut too_short.hdrs,
+            Header::new(b"content-length", b"34"),
+        );
+
+        if let Some(expected_resp_hdrs) = too_short.expect_resp_hdrs.as_mut() {
+            Http3Req::add_or_replace_header(
+                expected_resp_hdrs,
+                Header::new(b":status", b"400"),
+            );
+        }
+
+        let reqs = vec![too_short];
+        assert_eq!(Ok(()), do_test(reqs, assert_headers_only, true));
     }
 }

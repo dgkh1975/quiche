@@ -4,81 +4,125 @@ name: Stable
 
 env:
   RUSTFLAGS: "-D warnings"
-  TOOLCHAIN: "stable"
+  RUSTTOOLCHAIN: "stable"
+
+concurrency:
+  group: ${{ github.ref }}-stable
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
 
 jobs:
   quiche:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        tls-feature:
+          - "" # default, boringssl-vendored
+          - "boringssl-boring-crate"
+          - "openssl"
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
           components: clippy
-          override: true
 
-      - name: Install dependencies
-        run: sudo apt-get install libev-dev uthash-dev
+      - name: Unused dependency check
+        if: ${{ matrix.tls-feature == '' }}
+        uses: bnjbvr/cargo-machete@main
+
+      - name: Build OpenSSL
+        if: ${{ matrix.tls-feature == 'openssl' }}
+        run: |
+          git clone https://github.com/quictls/openssl
+          cd openssl
+          ./Configure --prefix="$PWD/install"
+          make -j"$(nproc)"
+          make install -j"$(nproc)"
+          echo "PKG_CONFIG_PATH=$PWD" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$PWD" >> "$GITHUB_ENV"
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose --features qlog
+        if: ${{ matrix.tls-feature != 'openssl' }}
+        run: cargo test --verbose --all-targets --features=ffi,qlog,${{ matrix.tls-feature }}
 
-      - name: Run cargo package
-        uses: actions-rs/cargo@v1
-        with:
-          command: package
-          args: --verbose --allow-dirty
+      # Don't run tokio-quiche tests when building with OpenSSL as they require
+      # BoringSSL.
+      - name: Run cargo test
+        if: ${{ matrix.tls-feature == 'openssl' }}
+        run: cargo test --verbose --all-targets --features=ffi,qlog,${{ matrix.tls-feature }} --workspace --exclude tokio-quiche
+
+      # Need to run doc tests separately.
+      # (https://github.com/rust-lang/cargo/issues/6669)
+      - name: Run cargo doc test
+        if: ${{ matrix.tls-feature != 'openssl' }}
+        run: cargo test --verbose --doc --features=ffi,qlog,${{ matrix.tls-feature }}
+
+      # Need to run doc tests separately.
+      # (https://github.com/rust-lang/cargo/issues/6669)
+      #
+      # Don't run tokio-quiche tests when building with OpenSSL as they require
+      # BoringSSL.
+      - name: Run cargo doc test
+        if: ${{ matrix.tls-feature == 'openssl' }}
+        run: cargo test --verbose --doc --features=ffi,qlog,${{ matrix.tls-feature }} --workspace --exclude tokio-quiche
+
+      # NOTE: this is disabled as it fails when building changes that bump
+      # version of local crates (e.g. when doing a `qlog` release) that have not
+      # been published yet, and we couldn't find a workaround.
+      #
+      # - name: Run cargo package
+      #   run: cargo package --verbose --workspace --exclude=quiche_apps --allow-dirty
 
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --examples -- -D warnings
+        run: cargo clippy --features=ffi,qlog,${{ matrix.tls-feature }} -- -D warnings
+
+      - name: Run cargo clippy on examples
+        run: cargo clippy --examples --features=ffi,qlog,${{ matrix.tls-feature }} -- -D warnings
 
       - name: Run cargo doc
-        uses: actions-rs/cargo@v1
-        with:
-          command: doc
-          args: --no-deps
+        run: cargo doc --no-deps --all-features --document-private-items
 
       - name: Build C examples
-        run: make -C examples
+        run: |
+          sudo apt-get install libev-dev uthash-dev
+          make -C quiche/examples
 
   quiche_macos:
-    runs-on: macos-latest
+    strategy:
+      matrix:
+        target:
+          - "macos-13"     # Intel (x86_64)
+          - "macos-latest" # Apple Silicon (M1)
+    runs-on: ${{ matrix.target }}
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose
+        run: cargo test --verbose --all-targets --features ffi,qlog
+
+      - name: Build C examples
+        run: |
+          brew install libev uthash
+          make -C quiche/examples
 
   quiche_ios:
     runs-on: macos-latest
@@ -88,147 +132,100 @@ jobs:
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
+    env:
+      IPHONEOS_DEPLOYMENT_TARGET: "10.0"
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: ${{ matrix.target }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Remove cdylib from iOS build
+        run: |
+          sed -i -e 's/, "cdylib"//g' quiche/Cargo.toml
 
       - name: Run cargo build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --target=${{ matrix.target }} --verbose
+        run: cargo build --target=${{ matrix.target }} --verbose
 
   quiche_windows:
-    runs-on: windows-latest
+    runs-on: windows-2022
     strategy:
       matrix:
-        target: ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc"]
+        target: ["x86_64-pc-windows-msvc", "i686-pc-windows-msvc", "x86_64-pc-windows-gnu", "i686-pc-windows-gnu"]
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: ${{ matrix.target }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: Set up MinGW for 64 bit
+        if: matrix.target == 'x86_64-pc-windows-gnu'
+        uses: bwoodsend/setup-winlibs-action@v1.10
+        with:
+          tag: 12.2.0-16.0.0-10.0.0-msvcrt-r5
+
+      - name: Set up MinGW for 32 bit
+        if: matrix.target == 'i686-pc-windows-gnu'
+        uses: bwoodsend/setup-winlibs-action@v1.10
+        with:
+          architecture: i686
+          tag: 12.2.0-16.0.0-10.0.0-msvcrt-r5
 
       - name: Install dependencies
-        uses: crazy-max/ghaction-chocolatey@v1
+        uses: crazy-max/ghaction-chocolatey@v3
         with:
           args: install nasm
 
+      - name: Run cargo build
+        if: endsWith(matrix.target, '-gnu')
+        run: cargo build --target=${{ matrix.target }} --verbose --all-targets --features=ffi,qlog,boringssl-boring-crate
+
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --target=${{ matrix.target }} --verbose
+        if: endsWith(matrix.target, '-msvc')
+        run: cargo test --target=${{ matrix.target }} --verbose --all-targets --features=ffi,qlog,boringssl-boring-crate
 
   quiche_multiarch:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        target: ["aarch64-unknown-linux-gnu", "armv7-unknown-linux-gnueabihf","i686-unknown-linux-gnu"]
+        target: ["aarch64-unknown-linux-gnu","armv7-unknown-linux-gnueabihf","i686-unknown-linux-gnu"]
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: ${{ matrix.target }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
 
-      - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --target=${{ matrix.target }} --verbose
-          use-cross: true
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
 
-  apps:
-    runs-on: ubuntu-latest
-    # Only run on "pull_request" event for external PRs. This is to avoid
-    # duplicate builds for PRs created from internal branches.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-        with:
-          submodules: 'recursive'
+      - name: Install cross
+        run: cargo-binstall -y cross
 
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-
-      - name: Run cargo build
-        uses: actions-rs/cargo@v1
-        with:
-          command: build
-          args: --verbose --manifest-path=tools/apps/Cargo.toml
-
-      - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --manifest-path=tools/apps/Cargo.toml -- -D warnings
-
-  qlog:
-    runs-on: ubuntu-latest
-    # Only run on "pull_request" event for external PRs. This is to avoid
-    # duplicate builds for PRs created from internal branches.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-        with:
-          submodules: 'recursive'
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-
-      - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --verbose --manifest-path=tools/qlog/Cargo.toml
-
-      - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --manifest-path=tools/qlog/Cargo.toml -- -D warnings
+      - name: Run cargo test using cross
+        run: cross test --target=${{ matrix.target }} --verbose --all-targets --features=ffi,qlog --workspace --exclude tokio-quiche
 
   http3_test:
     runs-on: ubuntu-latest
@@ -237,66 +234,21 @@ jobs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
+          components: clippy
 
       - name: Run cargo test
-        uses: actions-rs/cargo@v1
-        with:
-          command: test
-          args: --no-run --verbose --manifest-path=tools/http3_test/Cargo.toml
+        run: cargo test --no-run --verbose --manifest-path=tools/http3_test/Cargo.toml
 
       - name: Run cargo clippy
-        uses: actions-rs/cargo@v1
-        with:
-          command: clippy
-          args: --manifest-path=tools/http3_test/Cargo.toml -- -D warnings
-
-  nginx:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        version: ["1.16.1"]
-    # Only run on "pull_request" event for external PRs. This is to avoid
-    # duplicate builds for PRs created from internal branches.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-        with:
-          submodules: 'recursive'
-
-      - name: Install stable toolchain
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          override: true
-
-      - name: Install dependencies
-        run: sudo apt-get install libpcre3-dev zlib1g-dev
-
-      - name: Download NGINX sources
-        run: curl -O https://nginx.org/download/nginx-${{ matrix.version }}.tar.gz
-
-      - name: Extract NGINX sources
-        run: tar xzf nginx-${{ matrix.version }}.tar.gz
-
-      - name: Build NGINX
-        run: |
-          cd nginx-${{ matrix.version }} &&
-          patch -p01 < ../extras/nginx/nginx-1.16.patch &&
-          ./configure --with-http_ssl_module --with-http_v2_module --with-http_v3_module --with-openssl="../deps/boringssl" --with-quiche=".." --with-debug &&
-          make -j`nproc` &&
-          objs/nginx -V
+        run: cargo clippy --manifest-path=tools/http3_test/Cargo.toml -- -D warnings
 
   docker:
     runs-on: ubuntu-latest
@@ -305,113 +257,46 @@ jobs:
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Build Docker images
         run: make docker-build
 
-  android_ndk_old:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        ndk_version: ["r13b"]
-    # Only run on "pull_request" event for external PRs. This is to avoid
-    # duplicate builds for PRs created from internal branches.
-    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v2
-        with:
-          submodules: 'recursive'
-
-      - name: Install stable toolchain aarch64-linux-android
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: aarch64-linux-android
-          override: true
-
-      - name: Install stable toolchain arm-linux-androideabi
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: arm-linux-androideabi
-          override: true
-
-      - name: Install stable toolchain armv7-linux-androideabi
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: armv7-linux-androideabi
-          override: true
-
-      - name: Install stable toolchain i686-linux-android
-        uses: actions-rs/toolchain@v1
-        with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: i686-linux-android
-          override: true
-
-      - name: Download NDK
-        run: curl -O https://dl.google.com/android/repository/android-ndk-${{ matrix.ndk_version }}-linux-x86_64.zip
-
-      - name: Extract NDK
-        run: unzip -q android-ndk-${{ matrix.ndk_version }}-linux-x86_64.zip
-
-      - name: Run build
-        run: |
-          mkdir -p $TOOLCHAIN_DIR &&
-          tools/android/setup_android.sh &&
-          tools/android/build_android.sh --verbose --features ndk-old-gcc
-        env:
-          ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk-${{ matrix.ndk_version }}
-          TOOLCHAIN_DIR: ${{ github.workspace }}/toolchain
-
   android_ndk_lts:
     runs-on: ubuntu-latest
+    env:
+      API_LEVEL: "21"
     strategy:
       matrix:
-        ndk_version: ["21"]
-        target: ["aarch64-linux-android", "arm-linux-androideabi", "armv7-linux-androideabi", "i686-linux-android"]
+        target: ["aarch64-linux-android","armv7-linux-androideabi","x86_64-linux-android","i686-linux-android"]
+        include:
+          - target: "aarch64-linux-android"
+            arch: "arm64-v8a"
+          - target: "armv7-linux-androideabi"
+            arch: "armeabi-v7a"
+          - target: "x86_64-linux-android"
+            arch: "x86_64"
+          - target: "i686-linux-android"
+            arch: "x86"
     # Only run on "pull_request" event for external PRs. This is to avoid
     # duplicate builds for PRs created from internal branches.
     if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name != github.repository
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           submodules: 'recursive'
 
       - name: Install stable toolchain for the target
-        uses: actions-rs/toolchain@v1
+        uses: dtolnay/rust-toolchain@master
         with:
-          profile: minimal
-          toolchain: ${{ env.TOOLCHAIN }}
-          target: ${{ matrix.target }}
-          override: true
+          toolchain: ${{ env.RUSTTOOLCHAIN }}
+          targets: ${{ matrix.target }}
 
       - name: Install cargo-ndk
-        uses: actions-rs/install@v0.1
-        with:
-          crate: cargo-ndk
-          version: 1.0.0
-
-      - name: Download NDK
-        run: curl -O https://dl.google.com/android/repository/android-ndk-r${{ matrix.ndk_version }}-linux-x86_64.zip
-
-      - name: Extract NDK
-        run: unzip -q android-ndk-r${{ matrix.ndk_version }}-linux-x86_64.zip
+        run: cargo install cargo-ndk
 
       - name: Run cargo ndk
-        uses: actions-rs/cargo@v1
-        with:
-          command: ndk
-          args: --target ${{ matrix.target }} --android-platform ${{ matrix.ndk_version }} -- build --verbose
-        env:
-          ANDROID_NDK_HOME: ${{ github.workspace }}/android-ndk-r${{ matrix.ndk_version }}
+        run: cargo ndk --manifest-path quiche/Cargo.toml -t ${{ matrix.arch }} -p ${{ env.API_LEVEL }} -- build --verbose --features ffi
